@@ -1,303 +1,414 @@
-// ULTRA Physics Engine FINAL FIXED
-// Map removed — uses arrays only
+//% color="#E63022" weight=100 icon="\uf1e3" block="Jelly Physics"
+namespace jelly {
 
-namespace arcadePhysics {
+    // --- Core Classes ---
 
-    ////////////////////////////////////////////////////
-    // STORAGE (NO MAP)
-    ////////////////////////////////////////////////////
+    export class Point {
+        x: number;
+        y: number;
+        oldx: number;
+        oldy: number;
+        vx: number;
+        vy: number;
+        pinned: boolean;
+        radius: number;
 
-    let spritesList: Sprite[] = []
-    let bodies: PhysicsBody[] = []
-
-    function indexOfSprite(s: Sprite): number {
-        for (let i = 0; i < spritesList.length; i++) {
-            if (spritesList[i] == s) return i
-        }
-        return -1
-    }
-
-    function ensure(s: Sprite): PhysicsBody {
-        let i = indexOfSprite(s)
-        if (i >= 0) return bodies[i]
-
-        spritesList.push(s)
-
-        let body: PhysicsBody = {
-            enabled: true,
-
-            vx: 0, vy: 0,
-            ax: 0, ay: 0,
-            mass: 1,
-            friction: 0.05,
-            restitution: 0.2,
-            drag: 0,
-            gravityScale: 1,
-
-            angle: 0,
-            angularVelocity: 0,
-            torque: 0,
-            inertia: 10,
-            angularDrag: 0.02,
-
-            polygon: [],
-            mesh: [],
-
-            softMode: 0,
-            softPoints: [],
-            springK: 40,
-            springDamping: 0.9
+        constructor(x: number, y: number) {
+            this.x = x;
+            this.y = y;
+            this.oldx = x;
+            this.oldy = y;
+            this.vx = 0;
+            this.vy = 0;
+            this.pinned = false;
+            this.radius = 5; // collision radius
         }
 
-        bodies.push(body)
-        return body
-    }
+        update(gravity: number, friction: number) {
+            if (this.pinned) return;
 
-    ////////////////////////////////////////////////////
-    // TYPES
-    ////////////////////////////////////////////////////
+            this.vx = (this.x - this.oldx) * friction;
+            this.vy = (this.y - this.oldy) * friction;
 
-    interface Vec {
-        x: number
-        y: number
-    }
+            this.oldx = this.x;
+            this.oldy = this.y;
 
-    interface MeshPoint {
-        x: number
-        y: number
-        vx: number
-        vy: number
-    }
+            this.x += this.vx;
+            this.y += this.vy + gravity;
+        }
 
-    interface PhysicsBody {
-        enabled: boolean
+        constrain(width: number, height: number, bounce: number) {
+            if (this.pinned) return;
 
-        vx: number
-        vy: number
-        ax: number
-        ay: number
-
-        mass: number
-        friction: number
-        restitution: number
-        drag: number
-        gravityScale: number
-
-        angle: number
-        angularVelocity: number
-        torque: number
-        inertia: number
-        angularDrag: number
-
-        polygon: Vec[]
-        mesh: Vec[]
-
-        softMode: number
-        softPoints: MeshPoint[]
-        springK: number
-        springDamping: number
-    }
-
-    ////////////////////////////////////////////////////
-    // GLOBALS
-    ////////////////////////////////////////////////////
-
-    let gravity = 300
-    let timeScale = 1
-    let constraints: Constraint[] = []
-
-    ////////////////////////////////////////////////////
-    // CONSTRAINTS
-    ////////////////////////////////////////////////////
-
-    interface Constraint {
-        a: Sprite
-        b: Sprite
-        type: number // 0 distance, 1 hinge, 2 spring
-        length: number
-        stiffness: number
-    }
-
-    function solveConstraints() {
-        for (let c of constraints) {
-            let ia = indexOfSprite(c.a)
-            let ib = indexOfSprite(c.b)
-            if (ia < 0 || ib < 0) continue
-
-            let A = bodies[ia]
-            let B = bodies[ib]
-
-            let dx = c.b.x - c.a.x
-            let dy = c.b.y - c.a.y
-            let dist = Math.sqrt(dx * dx + dy * dy)
-            if (dist == 0) dist = 0.001
-
-            let nx = dx / dist
-            let ny = dy / dist
-
-            if (c.type == 0) {
-                // Distance
-                let diff = (dist - c.length) / dist
-                let offX = nx * diff * 0.5 * c.stiffness
-                let offY = ny * diff * 0.5 * c.stiffness
-
-                c.a.x += offX
-                c.a.y += offY
-                c.b.x -= offX
-                c.b.y -= offY
+            // Wall collisions
+            if (this.x > width - this.radius) {
+                this.x = width - this.radius;
+                this.oldx = this.x + (this.vx * bounce);
+            } else if (this.x < this.radius) {
+                this.x = this.radius;
+                this.oldx = this.x + (this.vx * bounce);
             }
 
-            if (c.type == 1) {
-                // Hinge
-                c.b.x = c.a.x
-                c.b.y = c.a.y
-            }
-
-            if (c.type == 2) {
-                // Spring
-                let force = (dist - c.length) * c.stiffness
-                A.vx += nx * force / A.mass
-                A.vy += ny * force / A.mass
-                B.vx -= nx * force / B.mass
-                B.vy -= ny * force / B.mass
+            // Floor/Ceiling collisions
+            if (this.y > height - this.radius) {
+                this.y = height - this.radius;
+                this.oldy = this.y + (this.vy * bounce);
+            } else if (this.y < this.radius) {
+                this.y = this.radius;
+                this.oldy = this.y + (this.vy * bounce);
             }
         }
     }
 
-    ////////////////////////////////////////////////////
-    // POLYGON COLLISION (SAT-lite)
-    ////////////////////////////////////////////////////
+    export class Stick {
+        p1: Point;
+        p2: Point;
+        length: number;
+        stiffness: number;
+        visible: boolean;
+        color: number;
 
-    function polygonOverlap(a: Sprite, b: Sprite): boolean {
-        // Fallback to overlap check if no polygon defined
-        let ia = indexOfSprite(a)
-        let ib = indexOfSprite(b)
-        if (ia < 0 || ib < 0) return false
-
-        if (bodies[ia].polygon.length == 0 ||
-            bodies[ib].polygon.length == 0) {
-            return a.overlapsWith(b)
+        constructor(p1: Point, p2: Point, length: number, stiffness: number) {
+            this.p1 = p1;
+            this.p2 = p2;
+            this.length = length;
+            this.stiffness = stiffness;
+            this.visible = true;
+            this.color = 1;
         }
 
-        return a.overlapsWith(b) // SAT simplified for Arcade
-    }
+        update() {
+            const dx = this.p2.x - this.p1.x;
+            const dy = this.p2.y - this.p1.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
 
-    ////////////////////////////////////////////////////
-    // PHYSICS MESH (RIGID MULTI POINT)
-    ////////////////////////////////////////////////////
+            if (dist === 0) return;
 
-    function updateMesh(s: Sprite, body: PhysicsBody) {
-        for (let p of body.mesh) {
-            p.x = s.x
-            p.y = s.y
-        }
-    }
+            const diff = this.length - dist;
+            const percent = (diff / dist) / 2;
 
-    ////////////////////////////////////////////////////
-    // ADVANCED SOFTBODY
-    ////////////////////////////////////////////////////
+            const offsetX = dx * percent * this.stiffness;
+            const offsetY = dy * percent * this.stiffness;
 
-    function updateSoft(body: PhysicsBody, s: Sprite) {
-        for (let p of body.softPoints) {
-            let dx = s.x - p.x
-            let dy = s.y - p.y
-
-            let fx = dx * body.springK
-            let fy = dy * body.springK
-
-            p.vx = (p.vx + fx * 0.016) * body.springDamping
-            p.vy = (p.vy + fy * 0.016) * body.springDamping
-
-            p.x += p.vx
-            p.y += p.vy
+            if (!this.p1.pinned) {
+                this.p1.x -= offsetX;
+                this.p1.y -= offsetY;
+            }
+            if (!this.p2.pinned) {
+                this.p2.x += offsetX;
+                this.p2.y += offsetY;
+            }
         }
 
-        if (body.softPoints.length > 0) {
-            s.x = body.softPoints[0].x
-            s.y = body.softPoints[0].y
+        draw() {
+            if (this.visible) {
+                screen.drawLine(this.p1.x, this.p1.y, this.p2.x, this.p2.y, this.color);
+            }
         }
     }
 
-    ////////////////////////////////////////////////////
-    // MAIN LOOP
-    ////////////////////////////////////////////////////
+    export class Body {
+        points: Point[];
+        sticks: Stick[];
+        attachedSprite: Sprite;
+        rotateSprite: boolean;
+        color: number;
+        drawNodes: boolean;
+        drawSticks: boolean;
+
+        constructor() {
+            this.points = [];
+            this.sticks = [];
+            this.rotateSprite = false;
+            this.color = 1;
+            this.drawNodes = true;
+            this.drawSticks = true;
+        }
+
+        addPoint(x: number, y: number): Point {
+            let p = new Point(x, y);
+            this.points.push(p);
+            return p;
+        }
+
+        // Updated: Removed default parameters to fix strict compiler errors
+        addStick(i1: number, i2: number, stiffness: number, length: number): Stick {
+            let p1 = this.points[i1];
+            let p2 = this.points[i2];
+            if (!p1 || !p2) return null;
+
+            if (length === -1) {
+                let dx = p2.x - p1.x;
+                let dy = p2.y - p1.y;
+                length = Math.sqrt(dx * dx + dy * dy);
+            }
+
+            let s = new Stick(p1, p2, length, stiffness);
+            s.color = this.color;
+            this.sticks.push(s);
+            return s;
+        }
+
+        update(gravity: number, friction: number, width: number, height: number, iterations: number, bounce: number) {
+            for (let p of this.points) {
+                p.update(gravity, friction);
+                p.constrain(width, height, bounce);
+            }
+
+            for (let i = 0; i < iterations; i++) {
+                for (let s of this.sticks) {
+                    s.update();
+                }
+            }
+
+            // Sprite Sync
+            if (this.attachedSprite && this.points.length > 0) {
+                let cx = 0, cy = 0;
+                for (let p of this.points) { cx += p.x; cy += p.y; }
+                cx /= this.points.length;
+                cy /= this.points.length;
+                this.attachedSprite.setPosition(cx, cy);
+            }
+        }
+
+        draw() {
+            if (this.drawSticks) {
+                for (let s of this.sticks) {
+                    s.color = this.color;
+                    s.draw();
+                }
+            }
+            if (this.drawNodes) {
+                for (let p of this.points) {
+                    screen.setPixel(p.x, p.y, this.color);
+                    screen.setPixel(p.x + 1, p.y, this.color);
+                    screen.setPixel(p.x, p.y + 1, this.color);
+                    screen.setPixel(p.x + 1, p.y + 1, this.color);
+                }
+            }
+        }
+    }
+
+    // --- Global State ---
+
+    let bodies: Body[] = [];
+    let gravity = 0.5;
+    let friction = 0.99;
+    let bounce = 0.9;
+    let iterations = 5;
+    let debugDraw = true;
+
+    // Interaction
+    let grabberSprite: Sprite = null;
+    let grabbedPoint: Point = null;
+    let grabRange = 20;
+
+    // --- Collision Logic ---
+
+    function resolveCollisions() {
+        // Simple point-to-point repulsion between different bodies
+        for (let i = 0; i < bodies.length; i++) {
+            for (let j = i + 1; j < bodies.length; j++) {
+                let b1 = bodies[i];
+                let b2 = bodies[j];
+
+                for (let p1 of b1.points) {
+                    for (let p2 of b2.points) {
+                        let dx = p1.x - p2.x;
+                        let dy = p1.y - p2.y;
+                        let distSq = dx * dx + dy * dy;
+                        let minDist = p1.radius + p2.radius;
+
+                        if (distSq < minDist * minDist && distSq > 0) {
+                            let dist = Math.sqrt(distSq);
+                            let overlap = minDist - dist;
+                            let force = overlap / 2; // Split the push
+
+                            let fx = (dx / dist) * force;
+                            let fy = (dy / dist) * force;
+
+                            if (!p1.pinned) {
+                                p1.x += fx;
+                                p1.y += fy;
+                            }
+                            if (!p2.pinned) {
+                                p2.x -= fx;
+                                p2.y -= fy;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Lifecycle ---
 
     game.onUpdate(function () {
-
-        let dt = 0.016 * timeScale
-
-        for (let i = 0; i < spritesList.length; i++) {
-
-            let s = spritesList[i]
-            let b = bodies[i]
-            if (!b.enabled) continue
-
-            // Linear
-            b.ay += gravity * b.gravityScale
-
-            b.vx += b.ax * dt
-            b.vy += b.ay * dt
-
-            b.vx *= (1 - b.drag)
-            b.vy *= (1 - b.drag)
-
-            s.x += b.vx * dt
-            s.y += b.vy * dt
-
-            // Rotation
-            let angAcc = b.torque / b.inertia
-            b.angularVelocity += angAcc * dt
-            b.angularVelocity *= (1 - b.angularDrag)
-            b.angle += b.angularVelocity * dt
-
-            s.setImage(s.image.rotated(Math.round(b.angle)))
-
-            b.ax = 0
-            b.ay = 0
-            b.torque = 0
-
-            if (b.softMode == 2) {
-                updateSoft(b, s)
-            }
-
-            updateMesh(s, b)
+        for (let b of bodies) {
+            b.update(gravity, friction, screen.width, screen.height, iterations, bounce);
         }
+        resolveCollisions();
 
-        solveConstraints()
-    })
+        // Handle Grabber
+        if (grabberSprite) {
+            if (controller.A.isPressed()) {
+                if (!grabbedPoint) {
+                    // Try to find a point close to sprite
+                    let closestDist = grabRange;
+                    for (let b of bodies) {
+                        for (let p of b.points) {
+                            let dx = grabberSprite.x - p.x;
+                            let dy = grabberSprite.y - p.y;
+                            let d = Math.sqrt(dx * dx + dy * dy);
+                            if (d < closestDist) {
+                                closestDist = d;
+                                grabbedPoint = p;
+                            }
+                        }
+                    }
+                }
 
-    ////////////////////////////////////////////////////
-    // BLOCK API
-    ////////////////////////////////////////////////////
+                // If holding a point, move it
+                if (grabbedPoint) {
+                    grabbedPoint.x = grabberSprite.x;
+                    grabbedPoint.y = grabberSprite.y;
+                    grabbedPoint.vx = 0;
+                    grabbedPoint.vy = 0;
+                }
+            } else {
+                grabbedPoint = null;
+            }
+        }
+    });
 
-    //% block
-    export function enablePhysics(sprite: Sprite) {
-        ensure(sprite)
+    game.onPaint(function () {
+        if (debugDraw) {
+            for (let b of bodies) {
+                b.draw();
+            }
+        }
+    });
+
+    // --- Block Definitions ---
+
+    /**
+     * Creates a new Soft Body Box
+     */
+    //% block="create soft box at x %x y %y size %size stiffness %stiffness"
+    //% stiffness.defl=0.5
+    //% size.defl=40
+    export function createSoftBox(x: number, y: number, size: number, stiffness: number): Body {
+        let b = new Body();
+        b.addPoint(x, y);
+        b.addPoint(x + size, y);
+        b.addPoint(x + size, y + size);
+        b.addPoint(x, y + size);
+
+        // -1 indicates auto-length
+        b.addStick(0, 1, stiffness, -1);
+        b.addStick(1, 2, stiffness, -1);
+        b.addStick(2, 3, stiffness, -1);
+        b.addStick(3, 0, stiffness, -1);
+
+        b.addStick(0, 2, stiffness, -1);
+        b.addStick(1, 3, stiffness, -1);
+
+        bodies.push(b);
+        return b;
     }
 
-    //% block
-    export function addPolygonPoint(sprite: Sprite, x: number, y: number) {
-        ensure(sprite).polygon.push({ x: x, y: y })
+    /**
+     * Creates a Rope
+     */
+    //% block="create rope at x %x y %y length %length segments %segments"
+    //% length.defl=50 segments.defl=5
+    export function createRope(x: number, y: number, length: number, segments: number): Body {
+        let b = new Body();
+        let segmentLen = length / segments;
+
+        for (let i = 0; i <= segments; i++) {
+            let p = b.addPoint(x, y + (i * segmentLen));
+            if (i == 0) p.pinned = true;
+            if (i > 0) {
+                b.addStick(i - 1, i, 1.0, -1);
+            }
+        }
+        bodies.push(b);
+        return b;
     }
 
-    //% block
-    export function addMeshPoint(sprite: Sprite, x: number, y: number) {
-        ensure(sprite).mesh.push({ x: x, y: y })
+    /**
+     * Attaches a Sprite to a Physics Body
+     */
+    //% block="attach sprite %sprite to body %body"
+    export function attachSprite(sprite: Sprite, body: Body) {
+        if (!body) return;
+        body.attachedSprite = sprite;
     }
 
-    //% block
-    export function createDistanceConstraint(a: Sprite, b: Sprite, length: number, stiffness: number) {
-        constraints.push({ a: a, b: b, type: 0, length: length, stiffness: stiffness })
+    /**
+     * Sets physics parameters
+     */
+    //% block="set physics gravity %g friction %f bounce %b"
+    //% g.defl=0.5 f.defl=0.99 b.defl=0.9
+    export function setPhysics(g: number, f: number, b: number) {
+        gravity = g;
+        friction = f;
+        bounce = b;
     }
 
-    //% block
-    export function createSpringConstraint(a: Sprite, b: Sprite, length: number, stiffness: number) {
-        constraints.push({ a: a, b: b, type: 2, length: length, stiffness: stiffness })
+    /**
+     * Toggle Debug Drawing
+     */
+    //% block="set debug draw %on"
+    //% on.shadow=toggleOnOff
+    //% on.defl=true
+    export function setDebugDraw(on: boolean) {
+        debugDraw = on;
     }
 
-    //% block
-    export function createHingeConstraint(a: Sprite, b: Sprite) {
-        constraints.push({ a: a, b: b, type: 1, length: 0, stiffness: 1 })
+    /**
+     * Set Body Color
+     */
+    //% block="set body %body color %color"
+    //% color.shadow="colorindexpicker"
+    export function setBodyColor(body: Body, color: number) {
+        if (body) body.color = color;
     }
 
+    /**
+     * Enable dragging with a sprite (A button)
+     */
+    //% block="enable dragging with sprite %sprite"
+    export function enableDragging(sprite: Sprite) {
+        grabberSprite = sprite;
+    }
+
+    /**
+     * Create an empty physics body
+     */
+    //% block="create empty body"
+    export function createEmptyBody(): Body {
+        let b = new Body();
+        bodies.push(b);
+        return b;
+    }
+
+    /**
+     * Add a node to a body
+     */
+    //% block="add node to %body at x %x y %y"
+    export function addNode(body: Body, x: number, y: number) {
+        if (body) body.addPoint(x, y);
+    }
+
+    /**
+     * Connect two nodes
+     */
+    //% block="connect nodes in %body from index %i1 to %i2 stiffness %stiffness"
+    //% stiffness.defl=1.0
+    export function connectNodes(body: Body, i1: number, i2: number, stiffness: number) {
+        if (body) body.addStick(i1, i2, stiffness, -1);
+    }
 }
