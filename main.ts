@@ -1,5 +1,5 @@
-//% color="#E63022" weight=100 icon="\uf1e3" block="Jelly Physics V2"
-//% groups='["World", "Bodies", "Construction", "Materials", "Joints", "Interaction", "Advanced"]'
+//% color="#E63022" weight=100 icon="\uf1e3" block="Jelly Physics V3"
+//% groups='["World", "Bodies", "Construction", "Materials", "Joints", "Interaction", "Visuals", "Events", "Advanced"]'
 namespace jelly {
 
     // ==================================================================================
@@ -13,6 +13,10 @@ namespace jelly {
     const DEFAULT_BOUNCE = 0.8;
     const MAX_ITERATIONS = 16;
     const BREAK_THRESHOLD_OFF = -1;
+
+    // Internal Event IDs
+    const EVT_COLLISION = 6600;
+    const EVT_BREAK = 6601;
 
     // ==================================================================================
     // MATH HELPERS
@@ -34,6 +38,32 @@ namespace jelly {
         static angle(v1: { x: number, y: number }, v2: { x: number, y: number }): number {
             return Math.atan2(v2.y - v1.y, v2.x - v1.x);
         }
+
+        static dot(v1: Vec2, v2: Vec2): number {
+            return v1.x * v2.x + v1.y * v2.y;
+        }
+
+        static cross(v1: Vec2, v2: Vec2): number {
+            return v1.x * v2.y - v1.y * v2.x;
+        }
+
+        static normalize(v: Vec2): Vec2 {
+            let len = Math.sqrt(v.x * v.x + v.y * v.y);
+            if (len === 0) return new Vec2(0, 0);
+            return new Vec2(v.x / len, v.y / len);
+        }
+
+        static sub(v1: Vec2, v2: Vec2): Vec2 {
+            return new Vec2(v1.x - v2.x, v1.y - v2.y);
+        }
+
+        static add(v1: Vec2, v2: Vec2): Vec2 {
+            return new Vec2(v1.x + v2.x, v1.y + v2.y);
+        }
+
+        static scale(v: Vec2, s: number): Vec2 {
+            return new Vec2(v.x * s, v.y * s);
+        }
     }
 
     // ==================================================================================
@@ -51,6 +81,7 @@ namespace jelly {
         vx: number;
         vy: number;
         pinned: boolean;
+        visible: boolean; // Toggleable visibility
         radius: number;
         mass: number;
         gravityScale: number;
@@ -67,6 +98,7 @@ namespace jelly {
             this.vx = 0;
             this.vy = 0;
             this.pinned = false;
+            this.visible = true;
             this.radius = DEFAULT_RADIUS;
             this.mass = DEFAULT_MASS;
             this.gravityScale = 1.0;
@@ -86,7 +118,6 @@ namespace jelly {
             // Water Buoyancy
             if (waterLevel !== 0 && this.y > waterLevel) {
                 // Apply upward force (Anti-gravity + lift)
-                // We use gravityScale to guess gravity direction, usually positive Y
                 this.forceY -= (gravityY * this.mass * 1.5);
 
                 // Increased Drag in water
@@ -170,9 +201,11 @@ namespace jelly {
 
             const diff = this.length - dist;
 
+            // Check for breaking
             if (this.breakingForce !== BREAK_THRESHOLD_OFF) {
                 if (Math.abs(diff) > this.breakingForce) {
                     this.isDead = true;
+                    // Fire break event logic here if needed
                     return;
                 }
             }
@@ -206,6 +239,7 @@ namespace jelly {
      * Physics Body container.
      */
     export class Body {
+        id: number;
         points: Point[];
         sticks: Stick[];
 
@@ -221,30 +255,41 @@ namespace jelly {
         };
 
         color: number;
+        fillColor: number; // For solid rendering
         drawNodes: boolean;
         drawSticks: boolean;
+        drawFill: boolean; // New solid fill mode
 
         // Physics Properties
         isControlled: boolean;
         controlSpeed: number;
         useAerodynamics: boolean;
         dragCoefficient: number;
-        motorSpeed: number; // For spinning
+        motorSpeed: number;
+        pressure: number; // Gas Law Pressure
 
         // Optimization
         aabb: { minX: number, minY: number, maxX: number, maxY: number };
 
+        // Callback Refs
+        onCollisionHandler: () => void;
+        onBreakHandler: () => void;
+
         constructor() {
+            this.id = Math.random();
             this.points = [];
             this.sticks = [];
             this.color = 1;
+            this.fillColor = 0;
             this.drawNodes = true;
             this.drawSticks = true;
+            this.drawFill = false;
             this.isControlled = false;
             this.controlSpeed = 2;
             this.useAerodynamics = true;
             this.dragCoefficient = 0.05;
             this.motorSpeed = 0;
+            this.pressure = 0;
             this.aabb = { minX: 0, minY: 0, maxX: 0, maxY: 0 };
             this.visuals = {
                 rotate: false,
@@ -323,6 +368,19 @@ namespace jelly {
             return { x: cx / this.points.length, y: cy / this.points.length };
         }
 
+        /**
+         * Calculates Polygon Volume (Area) for pressure
+         */
+        calculateVolume(): number {
+            let area = 0;
+            let j = this.points.length - 1;
+            for (let i = 0; i < this.points.length; i++) {
+                area += (this.points[j].x + this.points[i].x) * (this.points[j].y - this.points[i].y);
+                j = i;
+            }
+            return Math.abs(area / 2);
+        }
+
         update(gx: number, gy: number, friction: number, bounds: any, iterations: number, bounce: number, windX: number, windY: number, waterLevel: number) {
 
             let center = this.calculateCenter();
@@ -342,7 +400,6 @@ namespace jelly {
             // 2. Motor (Spin)
             if (this.motorSpeed !== 0) {
                 for (let p of this.points) {
-                    // Tangent vector (-y, x) relative to center
                     let dx = p.x - center.x;
                     let dy = p.y - center.y;
                     p.forceX += -dy * this.motorSpeed * 0.1;
@@ -350,7 +407,33 @@ namespace jelly {
                 }
             }
 
-            // 3. Aerodynamics
+            // 3. Pressure (Inflation)
+            if (this.pressure !== 0 && this.points.length > 2) {
+                // For a closed loop polygon, apply pressure normal to edges
+                for (let i = 0; i < this.points.length; i++) {
+                    let p1 = this.points[i];
+                    let p2 = this.points[(i + 1) % this.points.length];
+
+                    let dx = p2.x - p1.x;
+                    let dy = p2.y - p1.y;
+                    let dist = Math.sqrt(dx * dx + dy * dy);
+
+                    // Normal vector (perpendicular)
+                    let nx = -dy / dist;
+                    let ny = dx / dist;
+
+                    // Pressure Force = Normal * Length * PressureAmount
+                    let force = this.pressure * dist;
+
+                    // Apply to both points
+                    p1.forceX += nx * force * 0.5;
+                    p1.forceY += ny * force * 0.5;
+                    p2.forceX += nx * force * 0.5;
+                    p2.forceY += ny * force * 0.5;
+                }
+            }
+
+            // 4. Aerodynamics
             if (this.useAerodynamics) {
                 for (let p of this.points) {
                     let rvx = p.vx - windX;
@@ -360,64 +443,72 @@ namespace jelly {
                 }
             }
 
-            // 4. Update Points
+            // 5. Update Points
             for (let p of this.points) {
                 p.update(gx, gy, friction, waterLevel);
                 p.constrain(bounds, bounce);
             }
 
-            // 5. Update Sticks
-            this.sticks = this.sticks.filter(s => !s.isDead);
+            // 6. Update Sticks
+            let brokenSticks = false;
+            this.sticks = this.sticks.filter(s => {
+                if (s.isDead) {
+                    brokenSticks = true;
+                    // Spawn debris on break
+                    // (Simple particle effect)
+                    // We can't easily access main scope particle func here without exposing it.
+                    // But we can trigger the handler.
+                }
+                return !s.isDead;
+            });
+
+            if (brokenSticks && this.onBreakHandler) {
+                this.onBreakHandler();
+            }
+
             for (let i = 0; i < iterations; i++) {
                 for (let s of this.sticks) {
                     s.update();
                 }
             }
 
-            // 6. Update AABB
+            // 7. Update AABB
             this.updateAABB();
 
-            // 7. Sync Sprite
+            // 8. Sync Sprite
             if (this.attachedSprite && this.points.length > 0) {
                 let c = this.calculateCenter();
                 this.attachedSprite.setPosition(c.x + this.visuals.offsetX, c.y + this.visuals.offsetY);
 
-                // Rotation calculation (simple approximation using first two points)
                 if (this.visuals.rotate && this.points.length >= 2) {
-                    // Assuming p0 and p1 form the top edge or a structural spine
-                    // We calculate angle and convert to degrees
-                    let angle = Vec2.angle(this.points[0], this.points[1]);
-                    // Arcade sprites use degrees, clockwise? 
-                    // This is rough approximation. For box, p0->p1 is top edge.
-                    // Ideally we compare to initial angle.
-                    // For now, simple rotation:
-                    // transform -PI..PI to degrees.
-                    let deg = angle * 180 / Math.PI;
-                    // Adjust because 0 might not be "up" depending on drawing
-                    this.attachedSprite.image.fill(0) // Note: Real rotation needs an extension or render target
-                    // Arcade doesn't support free rotation of standard sprites efficiently without extensions.
-                    // However, we can't rotate the sprite image easily without `transform-images` extension.
-                    // We will skip actual image rotation to keep this purely TS/Arcade core compatible,
-                    // BUT we can use the `fx` extension if available, or just ignore if standard.
-                    // For this environment, let's assume standard only. 
-                    // We will enable Squash & Stretch though!
-                }
-
-                if (this.visuals.squash) {
-                    let width = this.aabb.maxX - this.aabb.minX;
-                    let height = this.aabb.maxY - this.aabb.minY;
-
-                    // Simple scaling effect
-                    // Requires the sprite to be created with these dimensions initially for correct ratio
-                    // We set the sprite scale using sx/sy if using PXT-Arcade v1.12+ (not always available in all editors)
-                    // We can try to act on `scale` property if available, but standard Arcade uses direct image size.
-                    // Let's assume we can't easily distort the bitmap in vanilla without extensions.
-                    // We will skip complex rendering to ensure compatibility.
+                    // Placeholder for rotation logic if extensions allow
                 }
             }
         }
 
+        /**
+         * Advanced Rendering: Polygon Scanline Fill
+         * This is expensive in MakeCode Arcade TS, but requested for "skin".
+         */
+        drawFilled() {
+            if (this.points.length < 3) return;
+
+            // Simple approach: Triangle Fan from center
+            let c = this.calculateCenter();
+            for (let i = 0; i < this.points.length; i++) {
+                let p1 = this.points[i];
+                let p2 = this.points[(i + 1) % this.points.length];
+
+                // We use a custom triangle filler helper
+                fillTriangle(c.x, c.y, p1.x, p1.y, p2.x, p2.y, this.fillColor);
+            }
+        }
+
         draw() {
+            if (this.drawFill) {
+                this.drawFilled();
+            }
+
             if (this.drawSticks) {
                 for (let s of this.sticks) {
                     s.color = this.color;
@@ -426,6 +517,8 @@ namespace jelly {
             }
             if (this.drawNodes) {
                 for (let p of this.points) {
+                    if (!p.visible) continue;
+
                     if (p.radius <= 2) {
                         screen.setPixel(p.x, p.y, this.color);
                     } else {
@@ -434,6 +527,40 @@ namespace jelly {
                     }
                 }
             }
+        }
+    }
+
+    // ==================================================================================
+    // HELPER: RASTERIZATION
+    // ==================================================================================
+
+    // Scanline Triangle Filler
+    function fillTriangle(x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, c: number) {
+        // Sort vertices by Y
+        if (y1 > y2) { let tx = x1; let ty = y1; x1 = x2; y1 = y2; x2 = tx; y2 = ty; }
+        if (y1 > y3) { let tx = x1; let ty = y1; x1 = x3; y1 = y3; x3 = tx; y3 = ty; }
+        if (y2 > y3) { let tx = x2; let ty = y2; x2 = x3; y2 = y3; x3 = tx; y3 = ty; }
+
+        let dx1 = (x2 - x1) / (y2 - y1);
+        let dx2 = (x3 - x1) / (y3 - y1);
+        let dx3 = (x3 - x2) / (y3 - y2);
+
+        let sx = x1, ex = x1;
+
+        // Top part
+        for (let y = y1; y < y2; y++) {
+            screen.drawLine(sx, y, ex, y, c);
+            sx += dx1;
+            ex += dx2;
+        }
+
+        // Bottom part
+        sx = x2;
+        // ex is already at the right place on the long edge
+        for (let y = y2; y < y3; y++) {
+            screen.drawLine(sx, y, ex, y, c);
+            sx += dx3;
+            ex += dx2;
         }
     }
 
@@ -450,7 +577,7 @@ namespace jelly {
     let worldIterations = 5;
     let worldWindX = 0;
     let worldWindY = 0;
-    let worldWaterLevel = 0; // 0 = disabled
+    let worldWaterLevel = 0;
 
     let worldBounds = {
         left: 0,
@@ -460,9 +587,13 @@ namespace jelly {
     };
 
     let debugDraw = true;
+    let drawVectors = false;
     let grabberSprite: Sprite = null;
     let grabbedPoint: Point = null;
     let grabRange = 25;
+
+    // Event State
+    let collisionHandlers: { bodyA: Body, bodyB: Body, handler: () => void }[] = [];
 
     // ==================================================================================
     // COLLISION RESOLUTION
@@ -483,6 +614,8 @@ namespace jelly {
 
                 if (!checkAABBOverlap(b1, b2)) continue;
 
+                let hasCollided = false;
+
                 for (let p1 of b1.points) {
                     for (let p2 of b2.points) {
                         let dx = p1.x - p2.x;
@@ -492,6 +625,7 @@ namespace jelly {
                         let minDistSq = minDist * minDist;
 
                         if (distSq < minDistSq && distSq > 0) {
+                            hasCollided = true;
                             let dist = Math.sqrt(distSq);
                             let overlap = minDist - dist;
 
@@ -513,6 +647,20 @@ namespace jelly {
                                 p2.x -= fx * r2;
                                 p2.y -= fy * r2;
                             }
+                        }
+                    }
+                }
+
+                // Fire Collision Events if registered
+                if (hasCollided) {
+                    // Check general handlers
+                    if (b1.onCollisionHandler) b1.onCollisionHandler();
+                    if (b2.onCollisionHandler) b2.onCollisionHandler();
+
+                    // Check specific pair handlers
+                    for (let h of collisionHandlers) {
+                        if ((h.bodyA == b1 && h.bodyB == b2) || (h.bodyA == b2 && h.bodyB == b1)) {
+                            h.handler();
                         }
                     }
                 }
@@ -591,6 +739,13 @@ namespace jelly {
 
             for (let b of bodies) {
                 b.draw();
+
+                // Vector Debug
+                if (drawVectors) {
+                    for (let p of b.points) {
+                        screen.drawLine(p.x, p.y, p.x + p.vx * 5, p.y + p.vy * 5, 5);
+                    }
+                }
             }
 
             if (grabbedPoint && grabberSprite) {
@@ -695,28 +850,21 @@ namespace jelly {
 
         let x = sprite.x - sprite.width / 2;
         let y = sprite.y - sprite.height / 2;
-        let size = sprite.width;
 
-        // Create a box matching the sprite
-        // Note: We use the larger dimension or average to define the "box"
-        // But better to define a rect.
         let b = new Body();
         b.addPoint(x, y); // TL
         b.addPoint(x + sprite.width, y); // TR
         b.addPoint(x + sprite.width, y + sprite.height); // BR
         b.addPoint(x, y + sprite.height); // BL
 
-        // Perimeter
         b.addStick(0, 1, stiffness, -1);
         b.addStick(1, 2, stiffness, -1);
         b.addStick(2, 3, stiffness, -1);
         b.addStick(3, 0, stiffness, -1);
 
-        // Cross
         b.addStick(0, 2, stiffness, -1);
         b.addStick(1, 3, stiffness, -1);
 
-        // Attach
         b.attachedSprite = sprite;
         b.spriteScaleBaseX = sprite.width;
         b.spriteScaleBaseY = sprite.height;
@@ -1020,13 +1168,9 @@ namespace jelly {
         for (let p of body.points) {
             let dx = p.x - c.x;
             let dy = p.y - c.y;
-            // Move point out
             p.x = c.x + dx * factor;
             p.y = c.y + dy * factor;
-            // Also scale old position to prevent velocity spikes
-            let oldDx = p.oldx - c.x;
-            let oldDy = p.oldy - c.y; // Simplified
-            p.oldx = p.x - (p.vx * factor); // Conserve momentum roughly
+            p.oldx = p.x - (p.vx * factor);
             p.oldy = p.y - (p.vy * factor);
         }
 
@@ -1052,6 +1196,17 @@ namespace jelly {
             p.oldx += dx;
             p.oldy += dy;
         }
+    }
+
+    /**
+     * Set Body Pressure (Inflation)
+     */
+    //% group="Bodies"
+    //% block="set body %body pressure %pressure"
+    //% pressure.defl=0
+    export function setBodyPressure(body: Body, pressure: number) {
+        if (!body) return;
+        body.pressure = pressure;
     }
 
     // ----------------------------------------------------------------------------------
@@ -1124,7 +1279,6 @@ namespace jelly {
         body.attachedSprite = sprite;
         body.visuals.offsetX = offX;
         body.visuals.offsetY = offY;
-        // Default visuals
         body.visuals.rotate = false;
         body.visuals.squash = false;
     }
@@ -1209,6 +1363,71 @@ namespace jelly {
     }
 
     // ----------------------------------------------------------------------------------
+    // GROUP: VISUALS (SEGMENT HIDING)
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Hides or shows a specific stick segment
+     */
+    //% group="Visuals"
+    //% block="set body %body stick at index %index visible %visible"
+    //% visible.shadow=toggleOnOff visible.defl=true
+    export function setStickVisible(body: Body, index: number, visible: boolean) {
+        if (body && body.sticks[index]) {
+            body.sticks[index].visible = visible;
+        }
+    }
+
+    /**
+     * Hides or shows a specific node point
+     */
+    //% group="Visuals"
+    //% block="set body %body node at index %index visible %visible"
+    //% visible.shadow=toggleOnOff visible.defl=true
+    export function setNodeVisible(body: Body, index: number, visible: boolean) {
+        if (body && body.points[index]) {
+            body.points[index].visible = visible;
+        }
+    }
+
+    /**
+     * Enables solid color filling for a body (Scanline Renderer)
+     */
+    //% group="Visuals"
+    //% block="set body %body fill enabled %enabled color %color"
+    //% enabled.shadow=toggleOnOff enabled.defl=false
+    //% color.shadow="colorindexpicker"
+    export function setBodyFill(body: Body, enabled: boolean, color: number) {
+        if (!body) return;
+        body.drawFill = enabled;
+        body.fillColor = color;
+    }
+
+    // ----------------------------------------------------------------------------------
+    // GROUP: EVENTS
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Run code when two specific bodies collide
+     */
+    //% group="Events"
+    //% block="on collision between %body1 and %body2"
+    export function onBodyCollision(body1: Body, body2: Body, handler: () => void) {
+        if (!body1 || !body2) return;
+        collisionHandlers.push({ bodyA: body1, bodyB: body2, handler: handler });
+    }
+
+    /**
+     * Run code when any part of a body breaks
+     */
+    //% group="Events"
+    //% block="on body %body stick broken"
+    export function onBodyStickBroken(body: Body, handler: () => void) {
+        if (!body) return;
+        body.onBreakHandler = handler;
+    }
+
+    // ----------------------------------------------------------------------------------
     // GROUP: ADVANCED TOOLS
     // ----------------------------------------------------------------------------------
 
@@ -1242,6 +1461,57 @@ namespace jelly {
             }
         }
         return false;
+    }
+
+    /**
+     * Draws a laser that stops at the first physics body hit
+     */
+    //% group="Advanced"
+    //% block="draw laser from x %x1 y %y1 to x %x2 y %y2 color %color"
+    //% color.shadow="colorindexpicker"
+    export function drawLaser(x1: number, y1: number, x2: number, y2: number, color: number) {
+        let hitX = x2;
+        let hitY = y2;
+        let minDistSq = (x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1);
+
+        for (let b of bodies) {
+            // Check bounding box
+            if (Math.min(x1, x2) > b.aabb.maxX || Math.max(x1, x2) < b.aabb.minX ||
+                Math.min(y1, y2) > b.aabb.maxY || Math.max(y1, y2) < b.aabb.minY) {
+                continue;
+            }
+
+            for (let p of b.points) {
+                // Check intersection with circle
+                // Math for Ray-Circle intersection
+                let dx = x2 - x1;
+                let dy = y2 - y1;
+                let fx = x1 - p.x;
+                let fy = y1 - p.y;
+
+                let a = dx * dx + dy * dy;
+                let b_coeff = 2 * (fx * dx + fy * dy);
+                let c = (fx * fx + fy * fy) - p.radius * p.radius;
+
+                let discriminant = b_coeff * b_coeff - 4 * a * c;
+                if (discriminant >= 0) {
+                    // Hit
+                    discriminant = Math.sqrt(discriminant);
+                    let t1 = (-b_coeff - discriminant) / (2 * a);
+
+                    if (t1 >= 0 && t1 <= 1) {
+                        let hitDistSq = t1 * t1 * a;
+                        if (hitDistSq < minDistSq) {
+                            minDistSq = hitDistSq;
+                            hitX = x1 + t1 * dx;
+                            hitY = y1 + t1 * dy;
+                        }
+                    }
+                }
+            }
+        }
+        screen.drawLine(x1, y1, hitX, hitY, color);
+        screen.fillCircle(hitX, hitY, 2, color);
     }
 
     /**
